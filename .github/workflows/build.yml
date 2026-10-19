@@ -1,0 +1,137 @@
+name: Build Rihlati (Android APK + Windows Fast EXE)
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Prepare Project, SDK Licenses, and Keystore
+        run: |
+          set +e
+          shopt -s nullglob
+          # 1. إذا كان المشروع مرفوعاً كملف مضغوط (.zip) فك ضغطه تلقائياً
+          for z in *.zip */*.zip; do
+            if [ -f "$z" ]; then
+              echo "Extracting $z ..."
+              unzip -o -q "$z" -d .
+            fi
+          done
+
+          # 2. البحث عن ملفات المشروع حتى لو كانت داخل مجلد فرعي
+          SETTINGS_FILE=$(find . -maxdepth 3 -name "settings.gradle.kts" | head -n 1)
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::لم يتم العثور على ملفات المشروع في المستودع! ارفع ملف rihlati-ready.zip مباشرة إلى المستودع."
+            ls -la
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          if [ "$PROJECT_DIR" != "." ]; then
+            cp -rn "$PROJECT_DIR"/. .
+          fi
+
+          # 3. إنشاء ملفات البيئة المطلوبة
+          if [ ! -f .env.example ]; then
+            echo "# GEMINI_API_KEY=MY_GEMINI_API_KEY" > .env.example
+          fi
+          if [ ! -f .env ]; then
+            cp .env.example .env
+          fi
+
+          # 4. توليد مفتاح التوقيع debug.keystore إن لم يكن موجوداً
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # 5. قبول تراخيص Android SDK
+          mkdir -p "$ANDROID_HOME/licenses"
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" > "$ANDROID_HOME/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          SDKM=$(find "$ANDROID_HOME" -name sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          fi
+          set -e
+
+      - name: Install Gradle 9.3.1 & Build Debug APK
+        run: |
+          if [ ! -f /tmp/gradle-9.3.1/bin/gradle ]; then
+            curl -fsSL https://services.gradle.org/distributions/gradle-9.3.1-bin.zip -o /tmp/gradle.zip
+            unzip -q -o /tmp/gradle.zip -d /tmp
+          fi
+          /tmp/gradle-9.3.1/bin/gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rihlati-Android-APK
+          path: app/build/outputs/apk/debug/*.apk
+
+  build-windows:
+    name: Build Windows Fast Desktop App (EXE)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Compile Native Windows EXE & Package Fast App
+        shell: pwsh
+        run: |
+          # 1. فك الضغط تلقائياً إذا كان المشروع مرفوعاً كملف .zip
+          Get-ChildItem -Path . -Filter *.zip -Recurse | ForEach-Object {
+            Write-Host "Extracting $($_.FullName)..."
+            Expand-Archive -Path $_.FullName -DestinationPath . -Force
+          }
+
+          $settings = Get-ChildItem -Path . -Filter "settings.gradle.kts" -Recurse | Select-Object -First 1
+          if (-not $settings) {
+            Write-Error "لم يتم العثور على ملفات المشروع! ارفع ملف rihlati-ready.zip إلى المستودع."
+            exit 1
+          }
+          $projDir = $settings.DirectoryName
+
+          $distDir = Join-Path $PWD "Rihlati-Windows-App"
+          $wwwDir = Join-Path $distDir "www"
+          New-Item -ItemType Directory -Force -Path $wwwDir | Out-Null
+
+          # 2. نسخ ملفات الواجهة المحسّنة والسريعة
+          Copy-Item -Path (Join-Path $projDir "app/src/main/assets/*") -Destination $wwwDir -Recurse -Force
+
+          # 3. تجميع ملف التشغيل الأصلي للويندوز Rihlati.exe
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $csFile = Join-Path $projDir "windows-app/RihlatiDesktop.cs"
+          $icoFile = Join-Path $projDir "windows-app/app.ico"
+          $exeOut = Join-Path $distDir "Rihlati.exe"
+
+          if (Test-Path $csFile) {
+            & $csc /nologo /target:winexe /out:$exeOut /win32icon:$icoFile /r:System.Windows.Forms.dll $csFile
+          }
+
+          $batFile = Join-Path $projDir "تشغيل_رحلتي_ويندوز_سريع.bat"
+          if (Test-Path $batFile) {
+            Copy-Item -Path $batFile -Destination (Join-Path $distDir "تشغيل_رحلتي_ويندوز_سريع.bat") -Force
+          }
+
+      - name: Upload Windows Desktop App (EXE)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rihlati-Windows-Desktop-EXE
+          path: Rihlati-Windows-App/
